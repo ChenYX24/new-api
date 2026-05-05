@@ -590,6 +590,11 @@ type ClaudeResponseInfo struct {
 	Done         bool
 }
 
+type claudeStreamContentBlock struct {
+	content dto.ClaudeMediaMessage
+	input   strings.Builder
+}
+
 func cacheCreationTokensForOpenAIUsage(usage *dto.Usage) int {
 	if usage == nil {
 		return 0
@@ -935,6 +940,201 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	return nil
 }
 
+func isClaudeEventStreamResponse(resp *http.Response, data []byte) bool {
+	if resp != nil && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return true
+	}
+	body := strings.TrimSpace(string(data))
+	return strings.HasPrefix(body, "event:") || strings.HasPrefix(body, "data:")
+}
+
+func usageClaude2OpenAI(usage *dto.Usage) dto.Usage {
+	if usage == nil {
+		return dto.Usage{}
+	}
+	clone := *usage
+	clone.InputTokens = usage.PromptTokens
+	clone.OutputTokens = usage.CompletionTokens
+	if clone.TotalTokens == 0 {
+		clone.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	return clone
+}
+
+func usageOpenAI2Claude(usage *dto.Usage) *dto.ClaudeUsage {
+	if usage == nil {
+		return nil
+	}
+	return &dto.ClaudeUsage{
+		InputTokens:                 usage.PromptTokens,
+		CacheReadInputTokens:        usage.PromptTokensDetails.CachedTokens,
+		CacheCreationInputTokens:    usage.PromptTokensDetails.CachedCreationTokens,
+		OutputTokens:                usage.CompletionTokens,
+		ClaudeCacheCreation5mTokens: usage.ClaudeCacheCreation5mTokens,
+		ClaudeCacheCreation1hTokens: usage.ClaudeCacheCreation1hTokens,
+	}
+}
+
+func appendClaudeStreamText(block *claudeStreamContentBlock, delta *dto.ClaudeMediaMessage) {
+	if block == nil || delta == nil {
+		return
+	}
+	if delta.Text != nil {
+		if block.content.Text == nil {
+			text := ""
+			block.content.Text = &text
+		}
+		*block.content.Text += *delta.Text
+	}
+	if delta.Thinking != nil {
+		if block.content.Thinking == nil {
+			thinking := ""
+			block.content.Thinking = &thinking
+		}
+		*block.content.Thinking += *delta.Thinking
+	}
+}
+
+func aggregateClaudeEventStream(data []byte, claudeInfo *ClaudeResponseInfo) (*dto.ClaudeResponse, *types.NewAPIError) {
+	blocks := map[int]*claudeStreamContentBlock{}
+	order := make([]int, 0)
+	stopReason := ""
+	role := "assistant"
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var claudeResponse dto.ClaudeResponse
+		if err := common.UnmarshalJsonStr(payload, &claudeResponse); err != nil {
+			common.SysLog("error unmarshalling aggregated stream response: " + err.Error())
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
+			return nil, types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		}
+
+		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
+		if claudeResponse.Message != nil && claudeResponse.Message.Role != "" {
+			role = claudeResponse.Message.Role
+		}
+
+		switch claudeResponse.Type {
+		case "message_start":
+			if claudeResponse.Message != nil {
+				if claudeInfo.ResponseId == "" {
+					claudeInfo.ResponseId = claudeResponse.Message.Id
+				}
+				if claudeInfo.Model == "" {
+					claudeInfo.Model = claudeResponse.Message.Model
+				}
+			}
+		case "content_block_start":
+			if claudeResponse.Index == nil || claudeResponse.ContentBlock == nil {
+				continue
+			}
+			idx := *claudeResponse.Index
+			block := &claudeStreamContentBlock{content: *claudeResponse.ContentBlock}
+			if block.content.Type == "text" && block.content.Text == nil {
+				text := ""
+				block.content.Text = &text
+			}
+			blocks[idx] = block
+			order = append(order, idx)
+		case "content_block_delta":
+			if claudeResponse.Index == nil || claudeResponse.Delta == nil {
+				continue
+			}
+			idx := *claudeResponse.Index
+			block := blocks[idx]
+			if block == nil {
+				block = &claudeStreamContentBlock{}
+				blocks[idx] = block
+				order = append(order, idx)
+			}
+			if claudeResponse.Delta.PartialJson != nil {
+				block.input.WriteString(*claudeResponse.Delta.PartialJson)
+				continue
+			}
+			appendClaudeStreamText(block, claudeResponse.Delta)
+		case "content_block_stop":
+			if claudeResponse.Index == nil {
+				continue
+			}
+			block := blocks[*claudeResponse.Index]
+			if block == nil || block.input.Len() == 0 {
+				continue
+			}
+			var input any
+			if err := json.Unmarshal([]byte(block.input.String()), &input); err == nil {
+				block.content.Input = input
+			} else {
+				block.content.Input = block.input.String()
+			}
+		case "message_delta":
+			if claudeResponse.Delta != nil && claudeResponse.Delta.StopReason != nil {
+				stopReason = *claudeResponse.Delta.StopReason
+			}
+		case "message_stop":
+			claudeInfo.Done = true
+		}
+	}
+
+	content := make([]dto.ClaudeMediaMessage, 0, len(order))
+	for _, idx := range order {
+		if block := blocks[idx]; block != nil {
+			content = append(content, block.content)
+		}
+	}
+	if len(content) == 0 && claudeInfo.ResponseText.Len() > 0 {
+		text := claudeInfo.ResponseText.String()
+		content = append(content, dto.ClaudeMediaMessage{Type: "text", Text: &text})
+	}
+	if claudeInfo.Usage != nil && claudeInfo.Usage.TotalTokens == 0 {
+		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+	}
+
+	return &dto.ClaudeResponse{
+		Id:         claudeInfo.ResponseId,
+		Type:       "message",
+		Role:       role,
+		Content:    content,
+		StopReason: stopReason,
+		Model:      claudeInfo.Model,
+		Usage:      usageOpenAI2Claude(claudeInfo.Usage),
+	}, nil
+}
+
+func HandleClaudeEventStreamAsResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {
+	claudeResponse, err := aggregateClaudeEventStream(data, claudeInfo)
+	if err != nil {
+		return err
+	}
+	var responseData []byte
+	var marshalErr error
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI:
+		openaiResponse := ResponseClaude2OpenAI(claudeResponse)
+		openaiResponse.Usage = usageClaude2OpenAI(claudeInfo.Usage)
+		responseData, marshalErr = json.Marshal(openaiResponse)
+	case types.RelayFormatClaude:
+		responseData, marshalErr = json.Marshal(claudeResponse)
+	}
+	if marshalErr != nil {
+		return types.NewError(marshalErr, types.ErrorCodeBadResponseBody)
+	}
+	httpResp.Header.Set("Content-Type", "application/json")
+	service.IOCopyBytesGracefully(c, httpResp, responseData)
+	return nil
+}
+
 func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
@@ -951,6 +1151,13 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	}
 	if common.DebugEnabled {
 		println("responseBody: ", string(responseBody))
+	}
+	if isClaudeEventStreamResponse(resp, responseBody) {
+		handleErr := HandleClaudeEventStreamAsResponse(c, info, claudeInfo, resp, responseBody)
+		if handleErr != nil {
+			return nil, handleErr
+		}
+		return claudeInfo.Usage, nil
 	}
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {

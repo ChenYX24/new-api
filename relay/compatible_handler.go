@@ -155,6 +155,13 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			}
 		}
 
+		if request, ok := convertedRequest.(*dto.GeneralOpenAIRequest); ok && strings.HasPrefix(info.OriginModelName, "claude-") {
+			request.Stream = lo.ToPtr(true)
+			if info.SupportStreamOptions {
+				request.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+			}
+		}
+
 		jsonData, err := common.Marshal(convertedRequest)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeJsonMarshalFailed, types.ErrOptionWithSkipRetry())
@@ -189,7 +196,10 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 
 	if resp != nil {
 		httpResp = resp.(*http.Response)
-		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		upstreamIsEventStream := strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		if info.ChannelType != constant.ChannelTypeAnthropic && !strings.HasPrefix(info.OriginModelName, "claude-") {
+			info.IsStream = info.IsStream || upstreamIsEventStream
+		}
 		if httpResp.StatusCode != http.StatusOK {
 			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码

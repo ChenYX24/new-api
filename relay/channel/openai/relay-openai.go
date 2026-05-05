@@ -103,6 +103,72 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 	return helper.ObjectData(c, lastStreamResponse)
 }
 
+func isOpenAIEventStreamResponse(resp *http.Response, data []byte) bool {
+	if resp != nil && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return true
+	}
+	body := strings.TrimSpace(string(data))
+	return strings.HasPrefix(body, "event:") || strings.HasPrefix(body, "data:")
+}
+
+func aggregateOpenAIEventStream(data []byte) (*dto.OpenAITextResponse, error) {
+	response := &dto.OpenAITextResponse{
+		Object:  "chat.completion",
+		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: dto.Message{Role: "assistant"}}},
+	}
+	var contentBuilder strings.Builder
+	var usage *dto.Usage
+	finishReason := ""
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var streamResponse dto.ChatCompletionsStreamResponse
+		if err := common.UnmarshalJsonStr(payload, &streamResponse); err != nil {
+			return nil, err
+		}
+		if response.Id == "" {
+			response.Id = streamResponse.Id
+		}
+		if response.Model == "" {
+			response.Model = streamResponse.Model
+		}
+		if response.Created == nil {
+			response.Created = streamResponse.Created
+		}
+		if service.ValidUsage(streamResponse.Usage) {
+			usage = streamResponse.Usage
+		}
+		for _, choice := range streamResponse.Choices {
+			if choice.Index >= len(response.Choices) {
+				response.Choices = append(response.Choices, dto.OpenAITextResponseChoice{Index: choice.Index, Message: dto.Message{Role: "assistant"}})
+			}
+			if choice.Delta.Role != "" {
+				response.Choices[choice.Index].Message.Role = choice.Delta.Role
+			}
+			contentBuilder.WriteString(choice.Delta.GetContentString())
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
+			}
+		}
+	}
+
+	content := contentBuilder.String()
+	response.Choices[0].Message.Content = content
+	response.Choices[0].FinishReason = finishReason
+	if usage != nil {
+		response.Usage = *usage
+	}
+	return response, nil
+}
+
 func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, "invalid response or response body")
@@ -202,6 +268,16 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 	if common.DebugEnabled {
 		println("upstream response body:", string(responseBody))
+	}
+	if isOpenAIEventStreamResponse(resp, responseBody) {
+		aggregatedResponse, aggErr := aggregateOpenAIEventStream(responseBody)
+		if aggErr != nil {
+			return nil, types.NewOpenAIError(aggErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+		responseBody, err = common.Marshal(aggregatedResponse)
+		if err != nil {
+			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
 	}
 	// Unmarshal to simpleResponse
 	if info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise() {
