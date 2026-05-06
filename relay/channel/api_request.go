@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	common2 "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -287,6 +289,40 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
+func recordApiCallRequest(c *gin.Context, info *common.RelayInfo, requestBody io.Reader) {
+	if c == nil || c.Request == nil || info == nil {
+		return
+	}
+	requestBodyText := ""
+	if buffer, ok := requestBody.(*bytes.Buffer); ok {
+		requestBodyText = buffer.String()
+	} else if readSeeker, ok := requestBody.(io.ReadSeeker); ok {
+		if bodyBytes, err := io.ReadAll(readSeeker); err == nil {
+			requestBodyText = string(bodyBytes)
+		}
+		_, _ = readSeeker.Seek(0, io.SeekStart)
+	}
+	model.RecordApiCallRequest(model.RecordApiCallRequestParams{
+		RequestId:          c.GetString(common2.RequestIdKey),
+		RetryIndex:         info.RetryIndex,
+		UserId:             info.UserId,
+		Username:           c.GetString("username"),
+		TokenId:            info.TokenId,
+		TokenName:          c.GetString("token_name"),
+		ChannelId:          info.ChannelId,
+		ChannelType:        info.ChannelType,
+		ModelName:          info.OriginModelName,
+		UpstreamModelName:  info.UpstreamModelName,
+		Group:              info.UsingGroup,
+		Method:             c.Request.Method,
+		RequestPath:        c.Request.URL.RequestURI(),
+		RelayFormat:        string(info.RelayFormat),
+		FinalRequestFormat: string(info.GetFinalRequestRelayFormat()),
+		IsStream:           info.IsStream,
+		RequestBody:        requestBodyText,
+	})
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
@@ -295,6 +331,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if common2.DebugEnabled {
 		println("fullRequestURL:", fullRequestURL)
 	}
+	recordApiCallRequest(c, info, requestBody)
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
@@ -484,6 +521,9 @@ func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	return doRequest(c, req, info)
 }
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	if c != nil && info != nil {
+		c.Set("relay_info", info)
+	}
 	var client *http.Client
 	var err error
 	if info.ChannelSetting.Proxy != "" {
@@ -518,9 +558,27 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
+		model.UpdateApiCallResponse(model.UpdateApiCallResponseParams{
+			RequestId:   c.GetString(common2.RequestIdKey),
+			RetryIndex:  info.RetryIndex,
+			ChannelId:   info.ChannelId,
+			Status:      "error",
+			Error:       err.Error(),
+			CompletedAt: common2.GetTimestamp(),
+			DurationMs:  model.ApiCallDurationMs(info.StartTime),
+		})
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
+		model.UpdateApiCallResponse(model.UpdateApiCallResponseParams{
+			RequestId:   c.GetString(common2.RequestIdKey),
+			RetryIndex:  info.RetryIndex,
+			ChannelId:   info.ChannelId,
+			Status:      "error",
+			Error:       "resp is nil",
+			CompletedAt: common2.GetTimestamp(),
+			DurationMs:  model.ApiCallDurationMs(info.StartTime),
+		})
 		return nil, errors.New("resp is nil")
 	}
 

@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -40,8 +41,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		return
 	}
 
-	// 无条件新建 StreamStatus
-	info.StreamStatus = relaycommon.NewStreamStatus()
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
 
 	// 确保响应体总是被关闭
 	defer func() {
@@ -255,6 +257,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
+				info.AppendStreamResponseBody(data)
 
 				select {
 				case dataChan <- data:
@@ -296,4 +299,22 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	} else {
 		logger.LogError(c, fmt.Sprintf("stream ended: %s, received=%d", info.StreamStatus.Summary(), info.ReceivedResponseCount))
 	}
+	status := "completed"
+	errText := ""
+	if !info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors() {
+		status = "error"
+		errText = info.StreamStatus.Summary()
+	}
+	model.UpdateApiCallResponse(model.UpdateApiCallResponseParams{
+		RequestId:          c.GetString(common.RequestIdKey),
+		RetryIndex:         info.RetryIndex,
+		ChannelId:          info.ChannelId,
+		StatusCode:         http.StatusOK,
+		Status:             status,
+		Error:              errText,
+		ResponseBody:       info.StreamResponseBody(),
+		CompletedAt:        common.GetTimestamp(),
+		DurationMs:         model.ApiCallDurationMs(info.StartTime),
+		FinalRequestFormat: string(info.GetFinalRequestRelayFormat()),
+	})
 }

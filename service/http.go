@@ -8,6 +8,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,6 +27,26 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 	if c.Writer == nil {
 		return
+	}
+
+	if relayInfoValue, ok := c.Get("relay_info"); ok {
+		if relayInfo, ok := relayInfoValue.(*relaycommon.RelayInfo); ok && relayInfo != nil && !relayInfo.IsStream {
+			statusCode := http.StatusOK
+			if src != nil {
+				statusCode = src.StatusCode
+			}
+			model.UpdateApiCallResponse(model.UpdateApiCallResponseParams{
+				RequestId:          c.GetString(common.RequestIdKey),
+				RetryIndex:         relayInfo.RetryIndex,
+				ChannelId:          relayInfo.ChannelId,
+				StatusCode:         statusCode,
+				ResponseBody:       string(data),
+				ResponseText:       string(data),
+				CompletedAt:        common.GetTimestamp(),
+				DurationMs:         model.ApiCallDurationMs(relayInfo.StartTime),
+				FinalRequestFormat: string(relayInfo.GetFinalRequestRelayFormat()),
+			})
+		}
 	}
 
 	body := io.NopCloser(bytes.NewBuffer(data))

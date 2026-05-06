@@ -302,9 +302,16 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 	return storage, nil
 }
 
+type readOnlyReadSeeker struct {
+	io.ReadSeeker
+}
+
 // ReaderOnly wraps an io.Reader to hide io.Closer, preventing http.NewRequest
 // from type-asserting io.ReadCloser and closing the underlying BodyStorage.
 func ReaderOnly(r io.Reader) io.Reader {
+	if rs, ok := r.(io.ReadSeeker); ok {
+		return readOnlyReadSeeker{ReadSeeker: rs}
+	}
 	return struct{ io.Reader }{r}
 }
 

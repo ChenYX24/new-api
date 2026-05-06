@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -873,6 +874,28 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	}
 }
 
+func recordClaudeApiCallResponse(c *gin.Context, info *relaycommon.RelayInfo, statusCode int, responseText string, errText string) {
+	if info == nil {
+		return
+	}
+	status := "completed"
+	if errText != "" || statusCode >= http.StatusBadRequest {
+		status = "error"
+	}
+	model.UpdateApiCallResponse(model.UpdateApiCallResponseParams{
+		RequestId:          c.GetString(common.RequestIdKey),
+		RetryIndex:         info.RetryIndex,
+		ChannelId:          info.ChannelId,
+		StatusCode:         statusCode,
+		Status:             status,
+		Error:              errText,
+		ResponseText:       responseText,
+		CompletedAt:        common.GetTimestamp(),
+		DurationMs:         model.ApiCallDurationMs(info.StartTime),
+		FinalRequestFormat: string(info.GetFinalRequestRelayFormat()),
+	})
+}
+
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -889,10 +912,12 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		}
 	})
 	if err != nil {
+		recordClaudeApiCallResponse(c, info, http.StatusOK, claudeInfo.ResponseText.String(), err.Error())
 		return nil, err
 	}
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
+	recordClaudeApiCallResponse(c, info, http.StatusOK, claudeInfo.ResponseText.String(), "")
 	return claudeInfo.Usage, nil
 }
 
@@ -1131,6 +1156,10 @@ func HandleClaudeEventStreamAsResponse(c *gin.Context, info *relaycommon.RelayIn
 		return types.NewError(marshalErr, types.ErrorCodeBadResponseBody)
 	}
 	httpResp.Header.Set("Content-Type", "application/json")
+	httpResp.Header.Del("Transfer-Encoding")
+	httpResp.Header.Del("Cache-Control")
+	httpResp.Header.Del("Connection")
+	httpResp.Header.Del("X-Accel-Buffering")
 	service.IOCopyBytesGracefully(c, httpResp, responseData)
 	return nil
 }

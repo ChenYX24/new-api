@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -171,6 +172,9 @@ type RelayInfo struct {
 
 	StreamStatus *StreamStatus
 
+	streamResponseBody strings.Builder
+	streamResponseMu   sync.Mutex
+
 	ThinkingContentInfo
 	TokenCountMeta
 	*ClaudeConvertInfo
@@ -178,6 +182,27 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+func (info *RelayInfo) AppendStreamResponseBody(data string) {
+	if info == nil || data == "" {
+		return
+	}
+	info.streamResponseMu.Lock()
+	defer info.streamResponseMu.Unlock()
+	if info.streamResponseBody.Len() > 0 {
+		info.streamResponseBody.WriteByte('\n')
+	}
+	info.streamResponseBody.WriteString(data)
+}
+
+func (info *RelayInfo) StreamResponseBody() string {
+	if info == nil {
+		return ""
+	}
+	info.streamResponseMu.Lock()
+	defer info.streamResponseMu.Unlock()
+	return info.streamResponseBody.String()
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
