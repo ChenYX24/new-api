@@ -78,6 +78,12 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 			IncludeUsage: true,
 		}
 	}
+	if strings.HasPrefix(info.OriginModelName, "claude-") && !info.IsStream {
+		aiRequest.Stream = lo.ToPtr(true)
+		if info.SupportStreamOptions {
+			aiRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+		}
+	}
 	return a.ConvertOpenAIRequest(c, info, aiRequest)
 }
 
